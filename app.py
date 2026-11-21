@@ -1,145 +1,358 @@
-import streamlit as st
-import cv2
-import numpy as np
-from PIL import Image
+import io
 import sqlite3
 from datetime import datetime
-from gtts import gTTS
-import io
+from pathlib import Path
 
-# --- 1. OFFLINE SQLITE DATABASE SETUP ---
-conn = sqlite3.connect("feedscan_offline.db", check_same_thread=False)
-c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS logs
-             (timestamp TEXT, batch_id TEXT, sample_type TEXT, 
-              mold_score REAL, strip_ph REAL, verdict TEXT)''')
-conn.commit()
+import cv2
+import numpy as np
+import pandas as pd
+import streamlit as st
+from PIL import Image
 
-# --- 2. IMAGE QUALITY CHECK (BLUR & BRIGHTNESS) ---
-def check_image_quality(img_bgr):
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
-    brightness = np.mean(gray)
-    return blur_score, brightness
+# -------------------- APP CONFIG --------------------
+st.set_page_config(
+    page_title="SilageSense | FEEDSCAN AI",
+    page_icon="🌾",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# --- 3. MOLD, PEST & CONTAMINATION DETECTOR ---
-def analyze_feed_mold(img_bgr, full_frame=False):
-    h, w, _ = img_bgr.shape
-    feed_zone = img_bgr if full_frame else img_bgr[int(h*0.2):int(h*0.8), int(w*0.05):int(w*0.5)]
-    hsv = cv2.cvtColor(feed_zone, cv2.COLOR_BGR2HSV)
-    
-    # 1. Detect greenish/grayish fungal mold
-    lower_mold = np.array((25, 30, 30), dtype=np.uint8)
-    upper_mold = np.array((95, 255, 220), dtype=np.uint8)
-    mold_mask = cv2.inRange(hsv, lower_mold, upper_mold)
-    
-    # 2. Detect dark reddish-brown pests, insects, or rotten clumps
-    lower_pest = np.array((0, 40, 10), dtype=np.uint8)
-    upper_pest = np.array((20, 255, 95), dtype=np.uint8)
-    pest_mask = cv2.inRange(hsv, lower_pest, upper_pest)
-    
-    combined_mask = cv2.bitwise_or(mold_mask, pest_mask)
-    contamination_pct = (np.sum(combined_mask > 0) / combined_mask.size) * 100
-    return round(contamination_pct, 1)
+DB_PATH = Path("feedscan_offline.db")
 
-# --- 4. TEST STRIP COLORIMETRY (pH / UREA STRIP) ---
-def analyze_test_strip(img_bgr):
-    h, w, _ = img_bgr.shape
-    strip_zone = img_bgr[int(h*0.35):int(h*0.65), int(w*0.65):int(w*0.85)]
-    hsv = cv2.cvtColor(strip_zone, cv2.COLOR_BGR2HSV)
-    
-    avg_hue = np.mean(hsv[:, :, 0])
-    avg_sat = np.mean(hsv[:, :, 1])
-    
-    if avg_sat < 35:
-        estimated_ph = 6.5
-    elif avg_hue < 15 or avg_hue > 165:
-        estimated_ph = 4.2
-    elif 15 <= avg_hue < 35:
-        estimated_ph = 5.5
-    elif 35 <= avg_hue < 85:
-        estimated_ph = 7.0
-    else:
-        estimated_ph = 8.5
-    return estimated_ph, round(avg_hue, 1)
 
-# --- 5. QR CODE READER ---
-def read_qr_code(img_bgr):
-    detector = cv2.QRCodeDetector()
-    data, _, _ = detector.detectAndDecode(img_bgr)
-    return data if data else "BATCH-TN-2026-01"
+# -------------------- DATABASE --------------------
+def get_connection():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
-# --- STREAMLIT MOBILE UI ---
-st.set_page_config(page_title="FEEDSCAN AI", page_icon="🐄", layout="centered")
-st.title("SilageSense")
-st.caption("Offline Rapid Feed & Silage Quality Screener | Team Quantum Coders")
 
-lang = st.radio("Language / மொழி:", ("English", "தமிழ் (Tamil)"), horizontal=True)
-sample_type = st.selectbox("Select Sample Type:", ("Cattle Feed Pellets", "Fermented Silage"))
-full_frame = st.checkbox("Feed-Only Photo (No Test Strip in Frame)", value=True)
-
-st.info("📋 **Guide:** Upload a close-up feed photo (checked above) OR uncheck to scan Feed on LEFT + Test Strip on RIGHT.")
-
-input_mode = st.radio("Capture Method:", ("Upload Test Photo", "Use Live Camera"), horizontal=True)
-img_file = st.camera_input("Scan Feed + Strip") if input_mode == "Use Live Camera" else st.file_uploader("Upload Feed + Strip Image", type=("jpg", "png", "jpeg"))
-
-if img_file is not None:
-    image = Image.open(img_file)
-    img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-    
-    blur, brightness = check_image_quality(img_bgr)
-    col1, col2 = st.columns(2)
-    col1.metric("Focus Score", f"{int(blur)}", "Clear" if blur > 50 else "Low Focus")
-    col2.metric("Lighting", f"{int(brightness)}/255", "Good" if brightness > 60 else "Use Flash")
-    
-    mold_pct = analyze_feed_mold(img_bgr, full_frame=full_frame)
-    est_ph, hue_val = (6.5, 0.0) if full_frame else analyze_test_strip(img_bgr)
-    batch_id = read_qr_code(img_bgr)
-    
-    st.image(image, caption=f"Detected Batch: {batch_id}", use_container_width=True)
-    
-    if mold_pct > 10.0 or est_ph > 7.8:
-        verdict = "RED - DO NOT FEED"
-        st.error(f"🔴 **{verdict}**")
-        advice_en = "High spoilage, pest infestation, or urea contamination detected. Do not feed to cattle. Send batch for lab testing."
-        advice_ta = "கெட்டுப்போன தீவனம், பூச்சித் தாக்குதல் அல்லது யூரியா கலப்படம் கண்டறியப்பட்டுள்ளது. மாடுகளுக்கு கொடுக்க வேண்டாம்."
-    elif mold_pct > 4.0 or (sample_type == "Fermented Silage" and est_ph > 5.0):
-        verdict = "YELLOW - CAUTION"
-        st.warning(f"🟡 **{verdict}**")
-        advice_en = "Moderate moisture, minor contamination, or pH drift detected. Sun-dry feed for 4 hours and inspect before feeding."
-        advice_ta = "ஈரப்பதம் அல்லது அமிலத்தன்மை மாற்றம் உள்ளது. தீவனத்தை 4 மணி நேரம் வெயிலில் உலர்த்தவும்."
-    else:
-        verdict = "GREEN - SAFE TO FEED"
-        st.success(f"🟢 **{verdict}**")
-        advice_en = "Feed quality and pH are within safe ICAR standards. Safe for daily cattle ration."
-        advice_ta = "தீவனத்தின் தரம் பாதுகாப்பாக உள்ளது. மாடுகளுக்கு தாராளமாக கொடுக்கலாம்."
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Mold / Pest Risk", f"{mold_pct}%")
-    m2.metric("Estimated pH", f"{est_ph}")
-    m3.metric("Test Cost", "₹5")
-    
-    advice_text = advice_ta if "Tamil" in lang else advice_en
-    st.write(f"**Advisory:** {advice_text}")
-    
-    try:
-        tts_lang = "ta" if "Tamil" in lang else "en"
-        tts = gTTS(text=advice_text, lang=tts_lang)
-        audio_fp = io.BytesIO()
-        tts.write_to_fp(audio_fp)
-        st.audio(audio_fp.getvalue(), format="audio/mp3")
-    except Exception:
-        st.caption("🔇 Offline Mode: Voice audio cached locally.")
-
-    if st.button("💾 Save Batch Result Offline"):
-        c.execute("INSERT INTO logs VALUES (?, ?, ?, ?, ?, ?)",
-                  (datetime.now().strftime("%Y-%m-%d %H:%M"), batch_id, sample_type, mold_pct, est_ph, verdict))
+def setup_database():
+    with get_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scans (
+                scan_id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                batch_id TEXT,
+                feed_name TEXT,
+                image_quality TEXT,
+                blur_score REAL,
+                brightness REAL,
+                visual_flag TEXT,
+                ph_value REAL,
+                ph_status TEXT,
+                notes TEXT
+            )
+            """
+        )
         conn.commit()
-        st.toast("Saved to local SQLite database!")
 
-with st.expander("📊 View Offline Batch Logs (SQLite Sync Queue)"):
-    rows = c.execute("SELECT * FROM logs ORDER BY timestamp DESC").fetchall()
-    if rows:
-        st.table(rows)
+
+def save_scan(record):
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO scans
+            (scan_id, timestamp, batch_id, feed_name, image_quality,
+             blur_score, brightness, visual_flag, ph_value, ph_status, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record["scan_id"], record["timestamp"], record["batch_id"],
+                record["feed_name"], record["image_quality"], record["blur_score"],
+                record["brightness"], record["visual_flag"], record["ph_value"],
+                record["ph_status"], record["notes"],
+            ),
+        )
+        conn.commit()
+
+
+def load_scans():
+    with get_connection() as conn:
+        return pd.read_sql_query(
+            "SELECT * FROM scans ORDER BY timestamp DESC", conn
+        )
+
+
+setup_database()
+
+
+# -------------------- IMAGE ANALYSIS --------------------
+def pil_to_bgr(image):
+    rgb = np.array(image.convert("RGB"))
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+
+def assess_image_quality(image):
+    bgr = pil_to_bgr(image)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    blur_score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    brightness = float(np.mean(gray))
+
+    problems = []
+    if blur_score < 35:
+        problems.append("Image may be blurry")
+    if brightness < 45:
+        problems.append("Image may be too dark")
+    elif brightness > 220:
+        problems.append("Image may be overexposed")
+
+    status = "Good" if not problems else "Retake recommended"
+    return status, blur_score, brightness, problems
+
+
+def screen_feed_image(image):
+    """
+    Basic colour-based visual screening.
+    This is NOT a validated mold, toxin, pesticide, or feed-safety detector.
+    """
+    bgr = pil_to_bgr(image)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+    # Broad colour masks used only to identify unusual visible regions.
+    # They cannot reliably distinguish mold from normal feed ingredients.
+    green_low = np.array([30, 35, 25])
+    green_high = np.array([95, 255, 255])
+    very_dark_low = np.array([0, 0, 0])
+    very_dark_high = np.array([180, 255, 55])
+
+    green_mask = cv2.inRange(hsv, green_low, green_high)
+    dark_mask = cv2.inRange(hsv, very_dark_low, very_dark_high)
+
+    total = max(1, image.width * image.height)
+    green_pct = 100.0 * cv2.countNonZero(green_mask) / total
+    dark_pct = 100.0 * cv2.countNonZero(dark_mask) / total
+
+    # Conservative wording: visual flag only, never a diagnosis.
+    if dark_pct > 18:
+        flag = "Dark regions noticed — inspect manually"
+    elif green_pct > 35:
+        flag = "Strong green colour detected — verify feed appearance"
     else:
-        st.write("No batches scanned yet.")
+        flag = "No strong colour flag from this basic screen"
+
+    return flag, green_pct, dark_pct
+
+
+def crop_center(image, box_fraction=0.35):
+    """Create a central crop for a simple pH-strip colour sample."""
+    w, h = image.size
+    crop_w = max(1, int(w * box_fraction))
+    crop_h = max(1, int(h * box_fraction))
+    left = (w - crop_w) // 2
+    top = (h - crop_h) // 2
+    return image.crop((left, top, left + crop_w, top + crop_h))
+
+
+def sample_strip_colour(image):
+    """Return median RGB colour from the central crop."""
+    crop = crop_center(image)
+    arr = np.asarray(crop.convert("RGB"), dtype=np.uint8)
+    median = np.median(arr.reshape(-1, 3), axis=0).astype(int)
+    return tuple(int(v) for v in median), crop
+
+
+# -------------------- SIDEBAR --------------------
+st.sidebar.markdown("## 🌾 SilageSense")
+st.sidebar.caption("FEEDSCAN AI · Preliminary feed screening")
+page = st.sidebar.radio(
+    "Navigate",
+    ["New Scan", "Scan History", "About & Limitations"],
+)
+st.sidebar.divider()
+st.sidebar.caption("Local database · Saves on this computer")
+
+
+# -------------------- HEADER --------------------
+st.markdown(
+    """
+    <div style="padding: 8px 0 18px 0;">
+      <div style="font-size: 13px; letter-spacing: 2px; color: #6b8f71; font-weight: 700;">
+        AGRICULTURE • LIVESTOCK • DIGITAL SCREENING
+      </div>
+      <h1 style="margin: 4px 0 0 0;">SilageSense <span style="color:#6b8f71;">/ FEEDSCAN AI</span></h1>
+      <p style="color: #8a918b; margin-top: 4px;">
+        A practical visual screening and batch-recording workspace for silage and feed samples.
+      </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# -------------------- NEW SCAN --------------------
+if page == "New Scan":
+    st.subheader("New sample assessment")
+    st.caption("Enter sample details, upload images, review screening indicators, and save the record.")
+
+    details_col, feed_col = st.columns([0.9, 1.1], gap="large")
+
+    with details_col:
+        st.markdown("### 01 · Sample details")
+        batch_id = st.text_input("Batch ID", placeholder="e.g. SILAGE-2026-001")
+        feed_name = st.selectbox(
+            "Feed / sample type",
+            ["Silage", "Green fodder", "Dry fodder", "Mixed feed", "Other"],
+        )
+        notes = st.text_area("Notes (optional)", placeholder="Location, storage condition, observations…", height=100)
+
+        st.markdown("### 02 · Feed image")
+        feed_file = st.file_uploader(
+            "Upload a clear feed sample photo",
+            type=["jpg", "jpeg", "png"],
+            key="feed_image",
+            help="Use even lighting, avoid filters, and include the sample clearly in the frame.",
+        )
+
+    with feed_col:
+        st.markdown("### 03 · pH strip image")
+        ph_file = st.file_uploader(
+            "Upload a photo of the normal pH strip",
+            type=["jpg", "jpeg", "png"],
+            key="ph_image",
+            help="Place the strip beside its colour chart if possible. Avoid shadows and glare.",
+        )
+        st.info(
+            "The pH strip reader is not calibrated yet. This version samples the strip colour "
+            "and records it; it does not invent a pH value."
+        )
+
+    feed_image = None
+    feed_results = None
+    if feed_file is not None:
+        try:
+            feed_image = Image.open(feed_file).convert("RGB")
+            st.markdown("#### Feed photo preview")
+            st.image(feed_image, use_container_width=True)
+            quality, blur, brightness, problems = assess_image_quality(feed_image)
+            visual_flag, green_pct, dark_pct = screen_feed_image(feed_image)
+            feed_results = (quality, blur, brightness, problems, visual_flag, green_pct, dark_pct)
+
+            q1, q2, q3 = st.columns(3)
+            q1.metric("Image quality", quality)
+            q2.metric("Sharpness score", f"{blur:.1f}")
+            q3.metric("Average brightness", f"{brightness:.1f}")
+            if problems:
+                st.warning(" · ".join(problems) + ". Consider taking another photo.")
+            st.markdown("**Visual screening note**")
+            st.write(visual_flag)
+            st.caption(
+                f"Colour coverage indicators only: green-like pixels {green_pct:.1f}% · "
+                f"dark pixels {dark_pct:.1f}%. These are not mold measurements."
+            )
+        except Exception as exc:
+            st.error(f"Could not read the feed image: {exc}")
+
+    strip_rgb = None
+    strip_crop = None
+    if ph_file is not None:
+        try:
+            strip_image = Image.open(ph_file).convert("RGB")
+            strip_rgb, strip_crop = sample_strip_colour(strip_image)
+            st.markdown("#### pH strip preview")
+            preview_col1, preview_col2 = st.columns(2)
+            with preview_col1:
+                st.image(strip_image, caption="Uploaded strip image", use_container_width=True)
+            with preview_col2:
+                st.image(strip_crop, caption="Central colour sample", use_container_width=True)
+            st.write(f"**Sampled median RGB:** `{strip_rgb}`")
+            st.caption(
+                "Lighting, camera white balance, strip brand, reaction time, and the printed "
+                "colour chart affect the reading. No numeric pH is assigned in this version."
+            )
+        except Exception as exc:
+            st.error(f"Could not read the pH strip image: {exc}")
+
+    st.divider()
+    can_save = feed_image is not None
+    if st.button("💾 Save scan record", type="primary", disabled=not can_save, use_container_width=True):
+        now = datetime.now()
+        scan_id = "FS-" + now.strftime("%Y%m%d-%H%M%S-%f")[:19]
+        if feed_results:
+            quality, blur, brightness, problems, visual_flag, green_pct, dark_pct = feed_results
+        else:
+            quality, blur, brightness, visual_flag = "Not analysed", None, None, "No feed image"
+        ph_status = f"Colour sampled RGB {strip_rgb}" if strip_rgb else "No pH strip image"
+        record = {
+            "scan_id": scan_id,
+            "timestamp": now.isoformat(timespec="seconds"),
+            "batch_id": batch_id.strip() or "Not provided",
+            "feed_name": feed_name,
+            "image_quality": quality,
+            "blur_score": blur,
+            "brightness": brightness,
+            "visual_flag": visual_flag,
+            "ph_value": None,
+            "ph_status": ph_status,
+            "notes": notes.strip(),
+        }
+        save_scan(record)
+        st.success(f"Scan saved successfully. Record ID: {scan_id}")
+        st.caption("This record is stored locally in feedscan_offline.db.")
+
+
+# -------------------- HISTORY --------------------
+elif page == "Scan History":
+    st.subheader("Scan history")
+    st.caption("Previously saved sample records from this computer.")
+    history = load_scans()
+
+    if history.empty:
+        st.info("No scans saved yet. Go to New Scan to create your first record.")
+    else:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total records", len(history))
+        m2.metric("Feed types", history["feed_name"].nunique())
+        m3.metric("Latest record", history.iloc[0]["timestamp"][:10])
+
+        search = st.text_input("Search by batch ID or feed type")
+        shown = history.copy()
+        if search.strip():
+            mask = (
+                shown["batch_id"].astype(str).str.contains(search, case=False, na=False)
+                | shown["feed_name"].astype(str).str.contains(search, case=False, na=False)
+            )
+            shown = shown[mask]
+
+        st.dataframe(shown, use_container_width=True, hide_index=True)
+        csv_data = shown.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Download records as CSV",
+            data=csv_data,
+            file_name="silagesense_scan_history.csv",
+            mime="text/csv",
+        )
+
+
+# -------------------- ABOUT --------------------
+else:
+    st.subheader("About this prototype")
+    st.markdown(
+        """
+        **SilageSense – FEEDSCAN AI** is a prototype for recording feed-sample observations
+        and performing basic image-based screening.
+
+        ### What this version can do
+        - Check whether a feed photo may be blurry or poorly lit.
+        - Calculate broad colour-coverage indicators from the uploaded image.
+        - Sample the central colour of a photographed pH strip.
+        - Store sample details and screening notes in a local SQLite database.
+        - Display and export scan history.
+
+        ### Important limitations
+        - Colour masks do **not** identify mold species, mycotoxins, insects, urea adulteration,
+          pathogens, or nutritional quality.
+        - A photograph alone cannot establish whether silage is safe for livestock.
+        - pH is **not calculated** until the exact strip's printed colour chart and range are
+          used to calibrate the reader under controlled lighting.
+        - Treat all outputs as preliminary observations. Suspected spoilage or unsafe feed
+          should be checked by a qualified veterinarian, animal nutritionist, or laboratory.
+
+        ### Local data
+        Scan records are stored in `feedscan_offline.db` in the project folder. Keep a backup
+        if the records are important.
+        """
+    )
+
+st.sidebar.divider()
+st.sidebar.caption("Prototype build · Use as a screening aid, not a safety certification.")
+
